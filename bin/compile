@@ -58,7 +58,7 @@ function run_npm() {
 }
 
 function manifest_versions() {
-  curl "http://${S3_BUCKET}.s3.amazonaws.com/manifest.${1}" -s -o - | tr -s '\n' ' '
+  curl "http://semver.io/${1}/versions" -s -o - | tr -s '\n' ' '
 }
 
 function resolve_version() {
@@ -126,10 +126,11 @@ declare -A engine_requests
 engine_defaults["node"]="0.10.x"
 engine_defaults["npm"]="1.3.x"
 
-engine_versions["node"]=$(manifest_versions "nodejs")
+engine_versions["node"]=$(manifest_versions "node")
 engine_requests["node"]=$(package_engine_version "node")
 
-engine_versions["npm"]=$(manifest_versions "npm")
+# FIXME: Small hack (we need to eliminate versions prior to 0.6.3)
+engine_versions["npm"]=$(manifest_versions "node")
 engine_requests["npm"]=$(package_engine_version "npm")
 
 echo "-----> Resolving engine versions"
