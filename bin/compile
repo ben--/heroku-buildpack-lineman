@@ -5,217 +5,146 @@
 ## 1. Node.js Setup  ##
 #######################
 
-# fail fast
-set -e
+#!/usr/bin/env bash
 
-# debug
-# set -x
+set -e            # fail fast
+set -o pipefail   # don't ignore exit codes when piping output
+# set -x          # enable debugging
 
-# clean up leaking environment
-unset GIT_DIR
-
-# config
-SCONS_VERSION="1.2.0"
-S3_BUCKET="heroku-buildpack-nodejs"
-
-# parse and derive params
+# Configure directories
 BUILD_DIR=$1
 CACHE_DIR=$2
-LP_DIR=`cd $(dirname $0); cd ..; pwd`
+env_dir=$3
 
-function error() {
-  echo " !     $*" >&2
-  exit 1
-}
+bp_dir=$(cd $(dirname $0); cd ..; pwd)
 
-function mktmpdir() {
-  dir=$(mktemp -t node-$1-XXXX)
-  rm -rf $dir
-  mkdir -p $dir
-  echo $dir
-}
+# Load some convenience functions like status(), echo(), and indent()
+source $bp_dir/bin/common.sh
 
-function indent() {
-  c='s/^/       /'
-  case $(uname) in
-    Darwin) sed -l "$c";;
-    *)      sed -u "$c";;
-  esac
-}
+# Output npm debug info on error
+trap cat_npm_debug_log ERR
 
-#node setup
+# Look in package.json's engines.node field for a semver range
+semver_range=$(cat $BUILD_DIR/package.json | $bp_dir/vendor/jq -r .engines.node)
 
-function run_npm() {
-  command="$1"
+# Resolve node version using semver.io
+node_version=$(curl --silent --get --data-urlencode "range=${semver_range}" https://semver.io/node/resolve)
 
-  cd $BUILD_DIR
-  HOME="$BUILD_DIR" $VENDORED_NODE/bin/node $VENDORED_NPM/cli.js $command 2>&1 | indent
+# Recommend using semver ranges in a safe manner
+if [ "$semver_range" == "null" ]; then
+  protip "Specify a node version in package.json"
+  semver_range=""
+elif [ "$semver_range" == "*" ]; then
+  protip "Avoid using semver ranges like '*' in engines.node"
+elif [ ${semver_range:0:1} == ">" ]; then
+  protip "Avoid using semver ranges starting with '>' in engines.node"
+fi
 
-  if [ "${PIPESTATUS[*]}" != "0 0" ]; then
-    echo " !     Failed to $command dependencies with npm"
-    exit 1
+# Output info about requested range and resolved node version
+if [ "$semver_range" == "" ]; then
+  status "Defaulting to latest stable node: $node_version"
+else
+  status "Requested node range:  $semver_range"
+  status "Resolved node version: $node_version"
+fi
+
+# Download node from Heroku's S3 mirror of nodejs.org/dist
+status "Downloading and installing node"
+node_url="http://s3pository.heroku.com/node/v$node_version/node-v$node_version-linux-x64.tar.gz"
+curl $node_url -s -o - | tar xzf - -C $BUILD_DIR
+
+# Move node (and npm) into ./vendor and make them executable
+mkdir -p $BUILD_DIR/vendor
+mv $BUILD_DIR/node-v$node_version-linux-x64 $BUILD_DIR/vendor/node
+chmod +x $BUILD_DIR/vendor/node/bin/*
+PATH=$BUILD_DIR/vendor/node/bin:$PATH
+
+# Run subsequent node/npm commands from the build path
+cd $BUILD_DIR
+
+# If node_modules directory is checked into source control then
+# rebuild any native deps. Otherwise, restore from the build cache.
+if test -d $BUILD_DIR/node_modules; then
+  status "Found existing node_modules directory; skipping cache"
+  status "Rebuilding any native dependencies"
+  npm rebuild 2>&1 | indent
+elif test -d $CACHE_DIR/node/node_modules; then
+  status "Restoring node_modules directory from cache"
+  cp -r $CACHE_DIR/node/node_modules $BUILD_DIR/
+
+  status "Pruning cached dependencies not specified in package.json"
+  npm prune 2>&1 | indent
+
+  if test -f $CACHE_DIR/node/.heroku/node-version && [ $(cat $CACHE_DIR/node/.heroku/node-version) != "$node_version" ]; then
+    status "Node version changed since last build; rebuilding dependencies"
+    npm rebuild 2>&1 | indent
   fi
-}
 
-function manifest_versions() {
-  curl "http://semver.io/${1}/versions" -s -o - | tr -s '\n' ' '
-}
+fi
 
-function resolve_version() {
-  available_versions="$1"
-  requested_version="$2"
-  default_version="$3"
+# Handle npm's new cert bug
+# http://blog.npmjs.org/post/78085451721/npms-self-signed-certificate-is-no-more
+if [ ! -f "$BUILD_DIR/.npmrc" ]; then
+  status "Writing a custom .npmrc to circumvent npm bugs"
+  echo "ca=" > "$BUILD_DIR/.npmrc"
+fi
 
-  args=""
-  for version in $available_versions; do args="${args} -v \"${version}\""; done
+# Scope config var availability only to `npm install`
+(
+  if [ -d "$env_dir" ]; then
+    status "Exporting config vars to environment"
+    export_env_dir $env_dir
+  fi
 
-  if [ "$2" == "" ]; then
-    args="${args} -r \"${default_version}\"";
+  status "Installing dependencies"
+  # Make npm output to STDOUT instead of its default STDERR
+  npm install --userconfig $BUILD_DIR/.npmrc --production 2>&1 | indent
+)
+
+# Persist goodies like node-version in the slug
+mkdir -p $BUILD_DIR/.heroku
+
+# Save resolved node version in the slug for later reference
+echo $node_version > $BUILD_DIR/.heroku/node-version
+
+# Purge node-related cached content, being careful not to purge the top-level
+# cache, for the sake of heroku-buildpack-multi apps.
+rm -rf $CACHE_DIR/node_modules # (for apps still on the older caching strategy)
+rm -rf $CACHE_DIR/node
+mkdir -p $CACHE_DIR/node
+
+# If app has a node_modules directory, cache it.
+if test -d $BUILD_DIR/node_modules; then
+  status "Caching node_modules directory for future builds"
+  cp -r $BUILD_DIR/node_modules $CACHE_DIR/node
+fi
+
+# Copy goodies to the cache
+cp -r $BUILD_DIR/.heroku $CACHE_DIR/node
+
+status "Cleaning up node-gyp and npm artifacts"
+rm -rf "$BUILD_DIR/.node-gyp"
+rm -rf "$BUILD_DIR/.npm"
+
+# If Procfile is absent, try to create one using `npm start`
+if [ ! -e $BUILD_DIR/Procfile ]; then
+  npm_start=$(cat $BUILD_DIR/package.json | $bp_dir/vendor/jq -r .scripts.start)
+
+  # If `scripts.start` is set in package.json, or a server.js file
+  # is present in the app root, then create a default Procfile
+  if [ "$npm_start" != "null" ] || [ -f $BUILD_DIR/server.js ]; then
+    status "No Procfile found; Adding npm start to new Procfile"
+    echo "web: npm start" > $BUILD_DIR/Procfile
   else
-    args="${args} -r \"${requested_version}\"";
-  fi
-
-  evaluated_versions=$(eval $bootstrap_node/bin/node $LP_DIR/vendor/node-semver/bin/semver ${args} || echo "")
-  echo "$evaluated_versions" | tail -n 1
-}
-
-function package_engine_version() {
-  version=$(cat $BUILD_DIR/package.json | $bootstrap_node/bin/node $LP_DIR/vendor/json/json engines.$1 2>/dev/null)
-  if [ $? == 0 ]; then
-    echo $version | sed -e 's/\([<>=]\) /\1/g'
-  fi
-}
-
-function package_resolve_version() {
-  engine="$1"
-  resolved_version=$(resolve_version "${engine_versions[$engine]}" "${engine_requests[$engine]}" "${engine_defaults[$engine]}")
-
-  if [ "${resolved_version}" == "" ]; then
-    error "Requested engine $engine version ${engine_requests[$engine]} does not match available versions: ${engine_versions[$engine]}"
-  else
-    echo $resolved_version
-  fi
-}
-
-function package_download() {
-  engine="$1"
-  version="$2"
-  location="$3"
-
-  mkdir -p $location
-  package="http://${S3_BUCKET}.s3.amazonaws.com/$engine-$version.tgz"
-  curl $package -s -o - | tar xzf - -C $location
-}
-
-function cat_npm_debug_log() {
-  if [ -f $BUILD_DIR/npm-debug.log ]; then
-    cat $BUILD_DIR/npm-debug.log
-  fi
-}
-
-trap cat_npm_debug_log EXIT
-
-bootstrap_node=$(mktmpdir bootstrap_node)
-package_download "nodejs" "0.4.7" $bootstrap_node
-
-# make some associative arrays
-declare -A engine_versions
-declare -A engine_defaults
-declare -A engine_requests
-
-engine_defaults["node"]="0.10.x"
-engine_defaults["npm"]="1.3.x"
-
-engine_versions["node"]=$(manifest_versions "node")
-engine_requests["node"]=$(package_engine_version "node")
-
-# FIXME: Small hack (we need to eliminate versions prior to 0.6.3)
-engine_versions["npm"]=$(manifest_versions "node")
-engine_requests["npm"]=$(package_engine_version "npm")
-
-echo "-----> Resolving engine versions"
-
-# add a warning if no version of node specified
-if [ "${engine_requests["node"]}" == "" ]; then
-  echo
-  echo "WARNING: No version of Node.js specified in package.json, see:" | indent
-  echo "https://devcenter.heroku.com/articles/nodejs-support#versions" | indent
-  echo
-fi
-
-NODE_VERSION=$(package_resolve_version "node")
-echo "Using Node.js version: ${NODE_VERSION}" | indent
-
-NPM_VERSION=$(package_resolve_version "npm")
-echo "Using npm version: ${NPM_VERSION}" | indent
-
-# cache directories
-CACHE_STORE_DIR="$CACHE_DIR/node_modules/$NODE_VERSION/$NPM_VERSION"
-CACHE_TARGET_DIR="$BUILD_DIR/node_modules"
-
-# s3 packages
-NODE_PACKAGE="http://${S3_BUCKET}.s3.amazonaws.com/nodejs-${NODE_VERSION}.tgz"
-NPM_PACKAGE="http://${S3_BUCKET}.s3.amazonaws.com/npm-${NPM_VERSION}.tgz"
-SCONS_PACKAGE="http://${S3_BUCKET}.s3.amazonaws.com/scons-${SCONS_VERSION}.tgz"
-
-# vendor directories
-VENDORED_NODE="$(mktmpdir node)"
-VENDORED_NPM="$(mktmpdir npm)"
-VENDORED_SCONS="$(mktmpdir scons)"
-
-# download and unpack packages
-echo "-----> Fetching Node.js binaries"
-package_download "nodejs" "${NODE_VERSION}" "${VENDORED_NODE}"
-package_download "npm" "${NPM_VERSION}" "${VENDORED_NPM}"
-package_download "scons" "${SCONS_VERSION}" "${VENDORED_SCONS}"
-
-# vendor node into the slug
-PATH="$BUILD_DIR/bin:$PATH"
-echo "-----> Vendoring node into slug"
-mkdir -p "$BUILD_DIR/bin"
-cp "$VENDORED_NODE/bin/node" "$BUILD_DIR/bin/node"
-
-# setting up paths for building
-PATH="$VENDORED_SCONS:$VENDORED_NODE/bin:$PATH"
-INCLUDE_PATH="$VENDORED_NODE/include"
-export CPATH="$INCLUDE_PATH:$CPATH"
-export CPPPATH="$INCLUDE_PATH:$CPPPATH"
-
-# restore node_modules cache
-if [ -d $CACHE_STORE_DIR ]; then
-  echo "-----> Restoring node_modules cache"
-  if [ -d $CACHE_TARGET_DIR ]; then
-    cp -r $CACHE_STORE_DIR/* $CACHE_TARGET_DIR/
-  else
-    cp -r $CACHE_STORE_DIR $CACHE_TARGET_DIR
+    status "Procfile not found and npm start script is undefined"
+    protip "Create a Procfile or specify a start script in package.json"
   fi
 fi
 
-# install dependencies with npm
-echo "-----> Installing dependencies with npm"
-run_npm "install"
-run_npm "rebuild"
-run_npm "prune" #<-- removes any cached dependencies that have been removed
-
-# if lineman wasn't in the package.json we need to locally install the latest verison now
-if [ ! -f $BUILD_DIR/node_modules/.bin/lineman ]; then
-  echo "------> Lineman wasn't found in the package.json. Installing latest from npm."
-  run_npm "install lineman"
-fi
-echo "Dependencies installed" | indent
-
-# cache node_modules
-if [ -d $CACHE_TARGET_DIR ]; then
-  echo "-----> Caching node_modules"
-  rm -rf $CACHE_STORE_DIR
-  mkdir -p $(dirname $CACHE_STORE_DIR)
-  cp -r $CACHE_TARGET_DIR $CACHE_STORE_DIR
-fi
-
-# build .profile.d/nodejs.sh
-echo "-----> Building runtime environment"
+# Update the PATH
+status "Building runtime environment"
 mkdir -p $BUILD_DIR/.profile.d
-echo "export PATH=\"\$HOME/bin:\$HOME/node_modules/.bin:\$PATH\"" > $BUILD_DIR/.profile.d/nodejs.sh
+echo "export PATH=\"\$HOME/vendor/node/bin:\$HOME/bin:\$HOME/node_modules/.bin:\$PATH\";" > $BUILD_DIR/.profile.d/nodejs.sh
 
 #######################
 ## 2. Lineman Setup  ##
