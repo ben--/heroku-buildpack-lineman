@@ -127,19 +127,19 @@ rm -rf "$BUILD_DIR/.node-gyp"
 rm -rf "$BUILD_DIR/.npm"
 
 # If Procfile is absent, try to create one using `npm start`
-# if [ ! -e $BUILD_DIR/Procfile ]; then
-#   npm_start=$(cat $BUILD_DIR/package.json | $bp_dir/vendor/jq -r .scripts.start)
+if [ ! -e $BUILD_DIR/Procfile ]; then
+  npm_start=$(cat $BUILD_DIR/package.json | $bp_dir/vendor/jq -r .scripts.start)
 
-#   # If `scripts.start` is set in package.json, or a server.js file
-#   # is present in the app root, then create a default Procfile
-#   if [ "$npm_start" != "null" ] || [ -f $BUILD_DIR/server.js ]; then
-#     status "No Procfile found; Adding npm start to new Procfile"
-#     echo "web: npm start" > $BUILD_DIR/Procfile
-#   else
-#     status "Procfile not found and npm start script is undefined"
-#     protip "Create a Procfile or specify a start script in package.json"
-#   fi
-# fi
+  # If `scripts.start` is set in package.json, or a server.js file
+  # is present in the app root, then create a default Procfile
+  if [ "$npm_start" != "null" ] || [ -f $BUILD_DIR/server.js ]; then
+    status "No Procfile found; Adding npm start to new Procfile"
+    echo "web: npm start" > $BUILD_DIR/Procfile
+  else
+    status "Procfile not found and npm start script is undefined"
+    protip "Create a Procfile or specify a start script in package.json"
+  fi
+fi
 
 # Update the PATH
 status "Building runtime environment"
@@ -178,6 +178,12 @@ echo "Web assets built" | indent
 
 echo "-----> Removing development node_modules from slug"
 npm prune --production
+
+#######################
+## 2.5. Backport of nodejs ##
+#######################
+
+exit 0
 
 #######################
 ## 3. Apache Setup   ##
