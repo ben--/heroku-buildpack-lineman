@@ -141,14 +141,6 @@ rm -rf "$BUILD_DIR/.npm"
 #   fi
 # fi
 
-if [ -f Procfile ]; then
-    status "Procile exists...checking for web process"
-    if [ `grep -o '^web:' Procfile` ]; then
-        status "Found web process. No need to bundle Apache."
-        exit 0
-    fi
-fi
-
 # Update the PATH
 status "Building runtime environment"
 mkdir -p $BUILD_DIR/.profile.d
